@@ -1,0 +1,114 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: logstream-postgres
+    environment:
+      POSTGRES_DB: logstream_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      # GOOD: Map to different host port to avoid conflict with local PostgreSQL
+      # Containers still connect via postgres:5432 internally
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - logstream-network
+
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    container_name: logstream-backend
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logstream_db
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE: logstream_db
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - logstream-network
+    # GOOD: Run migrations before starting server (ensures DB schema is up-to-date)
+    # CRITICAL: Migrations must complete successfully before app starts
+    command: sh -c "npm run migration:run && npm run start"
+    # GOOD: Health check for container orchestration (Docker, Kubernetes)
+    # Ensures service is ready before routing traffic
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s  # Allow time for migrations and startup
+
+  seed:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: development
+      # GOOD: Provide both DATABASE_URL and individual params for flexibility
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/logstream_db
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE: logstream_db
+    # GOOD: Run migrations before seeding (ensures schema is ready)
+    # CRITICAL: Migrations must complete successfully before seeding
+    command: sh -c "npm run migration:run && npm run seed"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - logstream-network
+    volumes:
+      - ./apps/backend/src:/app/src
+      - ./apps/backend/tsconfig.json:/app/tsconfig.json
+      - ./apps/backend/tsconfig.build.json:/app/tsconfig.build.json
+      - /app/node_modules
+
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+      # GOOD: Pass API URL as build arg (embeds URL at build time for Vite)
+      # CRITICAL: Vite requires env vars at build time, not runtime
+      args:
+        VITE_API_URL: http://localhost:3000
+    container_name: logstream-frontend
+    ports:
+      - "5173:80"
+    # GOOD: Wait for backend to be healthy before starting frontend
+    # Ensures API is available when frontend loads
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - logstream-network
+    # GOOD: Health check for nginx serving static files
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s  # Nginx starts quickly
+
+networks:
+  logstream-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
